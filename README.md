@@ -10,7 +10,7 @@ autoregressive pass, jointly emits:
 - a **faithful textual explanation** rendered deterministically from the two
   outputs above (`viescore2/verbalize.py`).
 
-Training is SFT followed by GRPO with a verifiable cell-level F_β reward.
+Training is SFT followed by GRPO with verifiable rewards: cell-level Dice + score accuracy + output-format validity.
 
 ## Repository layout
 
@@ -23,7 +23,7 @@ viescore2/
   build_eval.py              main evaluation-set builder
   build_*_eval.py               external benchmark converters (AbHuman, HAD, SynthScars,
                                 SDG-30K, MMRB2, PAL4VST)
-  train_grpo.py       GRPO training (cell-F_beta verifiable reward)
+  train_grpo.py       GRPO training (cell-level Dice reward)
   run_eval.py         evaluation harness: local checkpoints or API backends
                                 (--api-backend openai|gemini|anthropic), resume-safe
   merge_shards.py               merge row-sharded parallel eval runs (dedupe by id)

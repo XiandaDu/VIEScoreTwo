@@ -5,10 +5,9 @@ grpo — GRPO reinforcement fine-tuning for the evaluator.
 
 Rationale (see Visual-RFT, arXiv 2503.01785): the SFT objective is token-level
 cross-entropy, but the metric we care about is a SET-level localisation score
-(cell F-beta / IoU). GRPO with a VERIFIABLE reward optimises that metric
+(cell Dice / IoU). GRPO with a VERIFIABLE reward optimises that metric
 directly — the ground-truth 16×16 grid gives an exact, hack-proof reward, no
-learned reward model needed. This closes the train/eval objective gap and lets
-us trade precision↔recall via the F-beta β.
+learned reward model needed. This closes the train/eval objective gap.
 
 Pipeline:
   • Start from the merged SFT checkpoint (RL needs a competent cold-start).
@@ -16,25 +15,19 @@ Pipeline:
     its assistant target back into the GT grid for the reward.
   • TRL GRPOTrainer. --full-finetune (the published setting) implies --no-vllm;
     the vLLM colocate path is reachable only in the LoRA configuration.
-  • Reward = F-beta(cell) [main, masked on score-only rows]
-             + format bonus [small] + optional score reward.
+  • Reward = 1.0 × cell Dice [masked on score-only rows]
+             + 0.3 × score accuracy + 0.1 × output format.
 
 Env note: vLLM 0.23 ships CUDA-13 libs; the launchers export LD_LIBRARY_PATH so
 they are found. transformers/torch are unchanged.
 
-IMPORTANT — the argparse defaults are NOT the published recipe. Every RL row in
-the paper was produced by the launchers below, which pass the recipe explicitly:
-
-    # mainline RL (seed 1)
-    bash bash_scripts/grpo_seed2.sh        # replication seeds
-    bash bash_scripts/probe_queue.sh       # dev-only beta / Tversky probes
-
-Equivalent direct invocation:
+IMPORTANT — the argparse defaults are NOT the published recipe. The paper's
+GRPO runs pass the recipe explicitly:
     python viescore2/train_grpo.py \\
-        --policy   $DATA_ROOT/checkpoints/qwen3_8B_viescore2_v3_merged \\
+        --policy   $DATA_ROOT/checkpoints/qwen3_8B_viescore2_sft_merged \\
         --train    $DATA_ROOT/viescore2_data_full/train.json \\
         --output   $DATA_ROOT/checkpoints/qwen3_8B_viescore2_rl \\
-        --full-finetune --kl-beta 0 --learning-rate 1e-5 --beta-fbeta 1 \\
+        --full-finetune --kl-beta 0 --learning-rate 1e-5 \\
         --score-reward-weight 0.3 --num-generations 4 --grad-accum 8 \\
         --max-completion-length 768 --max-samples 2400
 """
@@ -80,20 +73,19 @@ def _completion_text(completion: Any) -> str:
     return str(completion)
 
 
-def _fbeta_from_grids(
-    gt: np.ndarray, pred: Optional[np.ndarray], beta: float,
+def _dice_from_grids(
+    gt: np.ndarray, pred: Optional[np.ndarray],
     major: Optional[np.ndarray] = None, w_major: float = 2.0,
 ) -> float:
-    """Cell-level F-beta. Both-empty (correct clean) → 1.0; unparseable → 0.0.
+    """Cell-level Dice. Both-empty (correct clean) → 1.0; unparseable → 0.0.
 
-    beta > 1 weights RECALL higher (find more problem cells), beta < 1 weights
-    PRECISION higher (fewer false alarms).
+        Dice = 2 TP_w / (2 TP_w + FP + FN_w)
 
-    ``major`` (importance weighting, SDG-style): GT cells marked severe count
-    ``w_major``× in TP/FN, so missing a fully-defective cell costs more than
-    missing a boundary cell. FP stays unweighted (a false alarm is a false
-    alarm). ``major=None``/all-zero degrades EXACTLY to the unweighted F-beta
-    the earlier RL runs validated."""
+    ``major`` (coverage weighting): GT cells marked "!" (high annotation
+    coverage) count ``w_major``× in TP/FN, so missing a fully-covered cell
+    costs more than missing a boundary cell. FP stays unweighted (a false
+    alarm is a false alarm). ``major=None``/all-zero gives the unweighted
+    cell Dice."""
     if pred is None:
         return 0.0
     gt_b = gt.astype(bool)
@@ -108,65 +100,10 @@ def _fbeta_from_grids(
     fn = float((w * (gt_b & ~pred_b)).sum())
     if tp == 0:
         return 0.0
-    precision = tp / (tp + fp)
-    recall = tp / (tp + fn)
-    b2 = beta * beta
-    denom = b2 * precision + recall
-    return (1 + b2) * precision * recall / denom if denom > 0 else 0.0
+    return 2.0 * tp / (2.0 * tp + fp + fn)
 
 
-def _tversky_from_grids(
-    gt: np.ndarray, pred: Optional[np.ndarray], alpha: float,
-    major: Optional[np.ndarray] = None, w_major: float = 2.0,
-    fp_dist_lambda: float = 0.0, fp_dist_cap: int = 4,
-) -> float:
-    """Severity-weighted Tversky index — the over-coverage-asymmetric
-    generalization of the cell F1/Dice reward (alpha=0.5 recovers F1
-    exactly, since Dice == F1 on sets).
-
-        T = TP_w / (TP_w + alpha * FP_w + (1 - alpha) * FN_w)
-
-    alpha > 0.5 penalizes false positives harder than misses — the direct
-    "prediction must not over-cover" knob. TP/FN keep the severity weights
-    (w_c = 1 + (w_major-1) * M_c) of the mainline reward; FP is severity-free
-    (a false alarm is a false alarm).
-
-    ``fp_dist_lambda`` > 0 adds the prediction-ALIGNMENT term: each FP cell's
-    cost grows with its chessboard distance to the nearest GT cell,
-    w_fp(c) = 1 + lambda * min(d_inf(c, GT), cap). A flag hugging the GT
-    boundary stays cheap (boundaries are genuinely ambiguous); a flag far
-    from any defect is expensive — "inside/near GT focused, far outside
-    penalized". Edge cases match the F-beta reward exactly: both-empty -> 1,
-    unparseable -> 0, pred-on-clean -> 0 (TP=0)."""
-    if pred is None:
-        return 0.0
-    gt_b = gt.astype(bool)
-    pred_b = pred.astype(bool)
-    if not gt_b.any() and not pred_b.any():
-        return 1.0
-    w = np.ones_like(gt, dtype=np.float64)
-    if major is not None:
-        w = w + (w_major - 1.0) * major.astype(np.float64)
-    tp = float((w * (gt_b & pred_b)).sum())
-    fn = float((w * (gt_b & ~pred_b)).sum())
-    fp_mask = ~gt_b & pred_b
-    if fp_dist_lambda > 0.0 and gt_b.any():
-        from scipy.ndimage import distance_transform_cdt
-        # chessboard distance of every cell to the nearest GT cell
-        dist = distance_transform_cdt(~gt_b, metric="chessboard").astype(np.float64)
-        w_fp = 1.0 + fp_dist_lambda * np.minimum(dist, float(fp_dist_cap))
-        fp = float((w_fp * fp_mask).sum())
-    else:
-        fp = float(fp_mask.sum())
-    if tp == 0:
-        return 0.0
-    denom = tp + alpha * fp + (1.0 - alpha) * fn
-    return tp / denom if denom > 0 else 0.0
-
-
-def make_reward_funcs(beta: float, w_major: float = 2.0,
-                      loc_reward: str = "fbeta", tversky_alpha: float = 0.7,
-                      fp_dist_lambda: float = 0.0, fp_dist_cap: int = 4):
+def make_reward_funcs(w_major: float = 2.0):
     """Build the (localization, format, score) reward functions.
 
     Supervision masking: rows whose target carries NO localization GT
@@ -191,13 +128,7 @@ def make_reward_funcs(beta: float, w_major: float = 2.0,
             gt = np.asarray(g, dtype=np.uint8)
             major = np.asarray(m, dtype=np.uint8) if m is not None else None
             pred = parse_grid_from_response(_completion_text(comp))
-            if loc_reward == "tversky":
-                out.append(_tversky_from_grids(
-                    gt, pred, tversky_alpha, major=major, w_major=w_major,
-                    fp_dist_lambda=fp_dist_lambda, fp_dist_cap=fp_dist_cap))
-            else:
-                out.append(_fbeta_from_grids(gt, pred, beta, major=major,
-                                             w_major=w_major))
+            out.append(_dice_from_grids(gt, pred, major=major, w_major=w_major))
         return out
 
     def reward_format(prompts=None, completions=None, gt_grid=None,
@@ -246,12 +177,7 @@ def make_reward_funcs(beta: float, w_major: float = 2.0,
                 out.append(0.0)
         return out
 
-    if loc_reward == "tversky":
-        reward_localization.__name__ = (
-            f"tversky{tversky_alpha:g}" +
-            (f"_d{fp_dist_lambda:g}" if fp_dist_lambda > 0 else ""))
-    else:
-        reward_localization.__name__ = f"wfbeta{beta:g}"
+    reward_localization.__name__ = "dice"
     reward_format.__name__ = "format"
     reward_score.__name__ = "score"
     return [reward_localization, reward_format, reward_score]
@@ -404,24 +330,11 @@ def build_dataset(train_json: str, max_samples: int = 0, seed: int = 42):
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main() -> int:
-    p = argparse.ArgumentParser(description="grpo: GRPO with verifiable cell-F-beta reward")
-    p.add_argument("--policy", default="$DATA_ROOT/checkpoints/qwen3_8B_viescore2_v3_merged",
-                   help="Cold-start policy = best v2 SFT checkpoint (merged HPO winner).")
+    p = argparse.ArgumentParser(description="grpo: GRPO with verifiable cell-level Dice reward")
+    p.add_argument("--policy", default="$DATA_ROOT/checkpoints/qwen3_8B_viescore2_sft_merged",
+                   help="Cold-start policy = merged SFT checkpoint.")
     p.add_argument("--train", default="$DATA_ROOT/viescore2_data_full/train.json")
     p.add_argument("--output", default="$DATA_ROOT/checkpoints/qwen3_8B_viescore2_rl")
-    p.add_argument("--loc-reward", choices=["fbeta", "tversky"], default="fbeta",
-                   help="Localization reward family: 'fbeta' (mainline) or "
-                        "'tversky' — the over-coverage-asymmetric Dice "
-                        "generalization (alpha=0.5 == F1/Dice).")
-    p.add_argument("--tversky-alpha", type=float, default=0.7,
-                   help="Tversky FP weight alpha (FN weight is 1-alpha); "
-                        ">0.5 punishes over-coverage harder.")
-    p.add_argument("--fp-dist-lambda", type=float, default=0.0,
-                   help="Prediction-alignment term: FP cost grows as "
-                        "1 + lambda*min(chessboard_dist_to_GT, cap). 0 = off.")
-    p.add_argument("--fp-dist-cap", type=int, default=4)
-    p.add_argument("--beta-fbeta", type=float, default=1.0,
-                   help="F-beta β for the reward. >1 favours recall, <1 favours precision.")
     p.add_argument("--format-reward-weight", type=float, default=0.1,
                    help="Weight of the schema-format reward (lambda_f in the "
                         "reward-decomposition ablation; mainline 0.1).")
@@ -430,7 +343,7 @@ def main() -> int:
                         "(1-|pred-gt|/10). 0 disables it (earlier runs' behaviour).")
     p.add_argument("--major-weight", type=float, default=2.0,
                    help="TP/FN weight of GT severe (\"!\") cells in the "
-                        "localization reward. 1.0 = plain unweighted F-beta "
+                        "localization reward. 1.0 = plain unweighted cell Dice "
                         "(importance-weighting ablation).")
     p.add_argument("--num-generations", type=int, default=8, help="GRPO group size.")
     p.add_argument("--kl-beta", type=float, default=0.04, help="GRPOConfig.beta (KL coeff).")
@@ -563,10 +476,7 @@ def main() -> int:
             f"{args.max_completion_length} (max {tlens[-1]} tokens). Raise the "
             f"cap or pass --allow-truncation to accept the bias explicitly.")
 
-    reward_funcs = make_reward_funcs(
-        args.beta_fbeta, w_major=args.major_weight,
-        loc_reward=args.loc_reward, tversky_alpha=args.tversky_alpha,
-        fp_dist_lambda=args.fp_dist_lambda, fp_dist_cap=args.fp_dist_cap)
+    reward_funcs = make_reward_funcs(w_major=args.major_weight)
 
     if args.full_finetune:
         peft_config = None  # train all parameters (bf16); see optim below
@@ -589,7 +499,7 @@ def main() -> int:
         num_train_epochs=args.epochs,
         beta=args.kl_beta,
         max_completion_length=args.max_completion_length,
-        reward_weights=[1.0, args.format_reward_weight, args.score_reward_weight],  # F-beta dominant,
+        reward_weights=[1.0, args.format_reward_weight, args.score_reward_weight],  # Dice dominant,
                                             # format a nudge, score optional
         scale_rewards="group",
         bf16=True,

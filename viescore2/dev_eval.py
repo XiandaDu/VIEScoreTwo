@@ -7,7 +7,7 @@ Evaluates a checkpoint on the FROZEN dev split
 disjoint from eval_suite by the leakage gate). Each row carries its own
 training-time user prompt, so evaluation is prompt-matched by construction.
 
-This is where the beta frontier (and any future sweep) is selected;
+This is where hyperparameter sweeps are selected;
 eval_suite remains frozen for the single pre-registered configuration.
 
 Usage:

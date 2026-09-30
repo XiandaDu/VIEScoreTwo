@@ -49,7 +49,7 @@ def test_extract_row_masks():
 
 
 def test_localization_reward_masked():
-    loc, fmt, score = make_reward_funcs(beta=1.0)
+    loc, fmt, score = make_reward_funcs()
     zeros = np.zeros((16, 16), dtype=np.uint8).tolist()
     gt = np.zeros((16, 16), dtype=np.uint8)
     gt[4, 7] = 1
@@ -76,7 +76,7 @@ def test_localization_reward_masked():
 
 
 def test_format_reward_schema_aware():
-    loc, fmt, score = make_reward_funcs(beta=1.0)
+    loc, fmt, score = make_reward_funcs()
     zeros = np.zeros((16, 16), dtype=np.uint8).tolist()
     # score-only rows: a bare score IS well-formed; a grid is not required
     out = fmt(completions=["score: 7/10", "pq: 3/10\nsc: 5/10", "junk!!"],
@@ -90,7 +90,7 @@ def test_format_reward_schema_aware():
 
 
 def test_score_reward_pal_masked():
-    loc, fmt, score = make_reward_funcs(beta=1.0)
+    loc, fmt, score = make_reward_funcs()
     zeros = np.zeros((16, 16), dtype=np.uint8).tolist()
     # PAL4VST rows (no score GT anywhere): whole group 0 → no gradient
     out = score(completions=["score: 7/10", "none"], gt_grid=[zeros] * 2,
